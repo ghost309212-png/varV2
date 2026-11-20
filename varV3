@@ -1,0 +1,837 @@
+--[[
+    TCS - Painel de Arbitragem & Admin v4 (Mobile / Delta Ready)
+    Abas: Chat Rápido | Placar | Funções | Câmera / Bola
+    - Travar Bola -> ":a" | Destravar Bola -> ":una"
+    - Freecam -> ":freecam"
+    - Comandos extras -> ":hko" e ":ako"
+    - Espectar Jogador -> usa o jogador selecionado (ou escolhido na lista)
+]]
+
+local Players = game:GetService("Players")
+local TextChatService = game:GetService("TextChatService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local SelectedPlayer = nil
+local SpectatingTarget = nil
+local HomeScore = 0
+local AwayScore = 0
+
+-- Limpa GUI anterior se já existir
+local parentGui = (gethui and gethui()) or CoreGui
+if parentGui:FindFirstChild("TCS_Arbitro_Hub") then
+    parentGui:FindFirstChild("TCS_Arbitro_Hub"):Destroy()
+end
+
+-- ==========================================
+-- FUNÇÕES DE BACKEND
+-- ==========================================
+
+local function SendChatMessage(msg)
+    task.spawn(function()
+        pcall(function()
+            if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+                local channels = TextChatService:FindFirstChild("TextChannels")
+                local rbxGeneral = channels and (channels:FindFirstChild("RBXGeneral") or channels:GetChildren()[1])
+                if rbxGeneral then
+                    rbxGeneral:SendAsync(msg)
+                end
+            else
+                local chatEvents = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+                if chatEvents and chatEvents:FindFirstChild("SayMessageRequest") then
+                    chatEvents.SayMessageRequest:FireServer(msg, "All")
+                end
+            end
+        end)
+    end)
+end
+
+-- Placar: atualiza valores/remotes do jogo SEM mandar :m no chat
+local function UpdateGameScore(teamType, delta, newValue)
+    pcall(function()
+        for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+            local n = obj.Name:lower()
+            if obj:IsA("RemoteEvent") and (n:find("score") or n:find("placar") or n:find("goal") or n:find("gol")) then
+                obj:FireServer(teamType, newValue, delta)
+            elseif obj:IsA("IntValue") or obj:IsA("NumberValue") then
+                if teamType == "Home" and (n == "home" or n == "homescore" or n == "casa") then
+                    obj.Value = newValue
+                elseif teamType == "Away" and (n == "away" or n == "awayscore" or n == "visitante") then
+                    obj.Value = newValue
+                end
+            end
+        end
+    end)
+end
+
+-- Cartões: vários nomes detectados
+local YellowCardNames = {
+    "yellow", "amarelo", "yellow card", "cartao amarelo", "cartão amarelo",
+    "yellowcard", "yc", "card_yellow", "amarela", "advertencia"
+}
+
+local RedCardNames = {
+    "red", "vermelho", "red card", "cartao vermelho", "cartão vermelho",
+    "redcard", "rc", "card_red", "vermelha", "expulsao", "expulsão"
+}
+
+local function MatchesCardName(itemName, nameList)
+    local lower = itemName:lower()
+    for _, pattern in ipairs(nameList) do
+        if lower:find(pattern, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function EquipOrGetCard(cardType)
+    local targetList = (cardType == "Yellow") and YellowCardNames or RedCardNames
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not char or not hum then return false end
+
+    for _, item in ipairs(char:GetChildren()) do
+        if item:IsA("Tool") and MatchesCardName(item.Name, targetList) then
+            return true
+        end
+    end
+
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") and MatchesCardName(item.Name, targetList) then
+                hum:EquipTool(item)
+                return true
+            end
+        end
+    end
+
+    local containers = {ReplicatedStorage, game:GetService("StarterPack"), workspace}
+    for _, container in ipairs(containers) do
+        for _, obj in ipairs(container:GetDescendants()) do
+            if obj:IsA("Tool") and MatchesCardName(obj.Name, targetList) then
+                local clone = obj:Clone()
+                clone.Parent = backpack or char
+                task.wait(0.05)
+                hum:EquipTool(clone)
+                return true
+            elseif (obj:IsA("ClickDetector") or obj:IsA("TouchTransmitter")) and obj.Parent and MatchesCardName(obj.Parent.Name, targetList) then
+                if obj:IsA("ClickDetector") and fireclickdetector then
+                    fireclickdetector(obj)
+                elseif obj:IsA("TouchTransmitter") and firetouchinterest and char:FindFirstChild("HumanoidRootPart") then
+                    firetouchinterest(char.HumanoidRootPart, obj.Parent, 0)
+                    task.wait(0.05)
+                    firetouchinterest(char.HumanoidRootPart, obj.Parent, 1)
+                end
+            end
+        end
+    end
+
+    SendChatMessage(cardType == "Yellow" and ":give me yellow" or ":give me red")
+    return false
+end
+
+local function GiveCardToSelected(cardType)
+    if not SelectedPlayer then return end
+    EquipOrGetCard(cardType)
+    if cardType == "Yellow" then
+        SendChatMessage(":m 🟨 CARTÃO AMARELO para " .. SelectedPlayer.Name .. "!")
+    else
+        SendChatMessage(":m 🟥 CARTÃO VERMELHO para " .. SelectedPlayer.Name .. "!")
+    end
+end
+
+-- Espectar Jogador (usa o selecionado por você)
+local function StopSpectate()
+    SpectatingTarget = nil
+    local cam = workspace.CurrentCamera
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if cam and hum then
+        cam.CameraType = Enum.CameraType.Custom
+        cam.CameraSubject = hum
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    if SpectatingTarget and SpectatingTarget.Character then
+        local cam = workspace.CurrentCamera
+        local targetHum = SpectatingTarget.Character:FindFirstChildOfClass("Humanoid")
+        if cam and targetHum then
+            cam.CameraType = Enum.CameraType.Custom
+            cam.CameraSubject = targetHum
+        end
+    end
+end)
+
+-- ==========================================
+-- INTERFACE PRINCIPAL (ESTILO REFERÊNCIA)
+-- ==========================================
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "TCS_Arbitro_Hub"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = parentGui
+
+local function MakeDraggable(dragHandle, targetFrame)
+    local dragging, dragInput, dragStart, startPos
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = targetFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    dragHandle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            targetFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- Bola flutuante ao fechar no X
+local FloatBall = Instance.new("TextButton")
+FloatBall.Name = "OpenBall"
+FloatBall.Size = UDim2.new(0, 52, 0, 52)
+FloatBall.Position = UDim2.new(0.03, 0, 0.45, 0)
+FloatBall.BackgroundColor3 = Color3.fromRGB(16, 22, 32)
+FloatBall.Text = "⚽"
+FloatBall.TextSize = 24
+FloatBall.TextColor3 = Color3.fromRGB(255, 255, 255)
+FloatBall.Visible = false
+FloatBall.Parent = ScreenGui
+
+local BallCorner = Instance.new("UICorner")
+BallCorner.CornerRadius = UDim.new(1, 0)
+BallCorner.Parent = FloatBall
+
+local BallStroke = Instance.new("UIStroke")
+BallStroke.Color = Color3.fromRGB(0, 150, 255)
+BallStroke.Thickness = 2.5
+BallStroke.Parent = FloatBall
+
+MakeDraggable(FloatBall, FloatBall)
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 530, 0, 320)
+MainFrame.Position = UDim2.new(0.5, -265, 0.5, -160)
+MainFrame.BackgroundColor3 = Color3.fromRGB(18, 21, 26)
+MainFrame.BackgroundTransparency = 0.16
+MainFrame.BorderSizePixel = 0
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 10)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(45, 55, 70)
+MainStroke.Thickness = 1.2
+MainStroke.Parent = MainFrame
+
+local TopBar = Instance.new("Frame")
+TopBar.Name = "TopBar"
+TopBar.Size = UDim2.new(1, 0, 0, 34)
+TopBar.BackgroundColor3 = Color3.fromRGB(12, 15, 20)
+TopBar.BackgroundTransparency = 0.2
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+
+local TopCorner = Instance.new("UICorner")
+TopCorner.CornerRadius = UDim.new(0, 10)
+TopCorner.Parent = TopBar
+
+MakeDraggable(TopBar, MainFrame)
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -50, 1, 0)
+TitleLabel.Position = UDim2.new(0, 14, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "STATUS: Painel Árbitro TCS"
+TitleLabel.TextColor3 = Color3.fromRGB(220, 230, 240)
+TitleLabel.Font = Enum.Font.GothamSemibold
+TitleLabel.TextSize = 13
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TopBar
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Name = "CloseButton"
+CloseBtn.Size = UDim2.new(0, 28, 0, 26)
+CloseBtn.Position = UDim2.new(1, -33, 0, 4)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(185, 42, 42)
+CloseBtn.Text = "X"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 14
+CloseBtn.Parent = TopBar
+
+local CloseCorner = Instance.new("UICorner")
+CloseCorner.CornerRadius = UDim.new(0, 6)
+CloseCorner.Parent = CloseBtn
+
+CloseBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+    FloatBall.Visible = true
+end)
+
+FloatBall.MouseButton1Click:Connect(function()
+    FloatBall.Visible = false
+    MainFrame.Visible = true
+end)
+
+-- Menu Lateral Esquerdo (1 embaixo do outro)
+local SideBar = Instance.new("Frame")
+SideBar.Name = "SideBar"
+SideBar.Size = UDim2.new(0, 136, 1, -42)
+SideBar.Position = UDim2.new(0, 8, 0, 38)
+SideBar.BackgroundColor3 = Color3.fromRGB(22, 26, 33)
+SideBar.BackgroundTransparency = 0.25
+SideBar.Parent = MainFrame
+
+local SideCorner = Instance.new("UICorner")
+SideCorner.CornerRadius = UDim.new(0, 8)
+SideCorner.Parent = SideBar
+
+local SideLayout = Instance.new("UIListLayout")
+SideLayout.Padding = UDim.new(0, 7)
+SideLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+SideLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+SideLayout.Parent = SideBar
+
+local SidePad = Instance.new("UIPadding")
+SidePad.PaddingTop = UDim.new(0, 10)
+SidePad.Parent = SideBar
+
+local ContentArea = Instance.new("Frame")
+ContentArea.Name = "ContentArea"
+ContentArea.Size = UDim2.new(1, -158, 1, -42)
+ContentArea.Position = UDim2.new(0, 150, 0, 38)
+ContentArea.BackgroundTransparency = 1
+ContentArea.Parent = MainFrame
+
+local Pages = {}
+local TabButtons = {}
+
+local function SelectTab(tabName)
+    for name, page in pairs(Pages) do
+        page.Visible = (name == tabName)
+    end
+    for name, btn in pairs(TabButtons) do
+        if name == tabName then
+            btn.BackgroundColor3 = Color3.fromRGB(0, 132, 214)
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            btn.BackgroundColor3 = Color3.fromRGB(32, 37, 46)
+            btn.TextColor3 = Color3.fromRGB(205, 212, 222)
+        end
+    end
+end
+
+local function CreateTab(name, labelText)
+    local btn = Instance.new("TextButton")
+    btn.Name = name .. "_Tab"
+    btn.Size = UDim2.new(0.92, 0, 0, 36)
+    btn.BackgroundColor3 = Color3.fromRGB(32, 37, 46)
+    btn.Text = labelText
+    btn.TextColor3 = Color3.fromRGB(205, 212, 222)
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 12
+    btn.Parent = SideBar
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent = btn
+
+    local page = Instance.new("ScrollingFrame")
+    page.Name = name .. "_Page"
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 4
+    page.ScrollBarImageColor3 = Color3.fromRGB(0, 132, 214)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.Visible = false
+    page.Parent = ContentArea
+
+    Pages[name] = page
+    TabButtons[name] = btn
+
+    btn.MouseButton1Click:Connect(function()
+        SelectTab(name)
+    end)
+
+    return page
+end
+
+-- Abas (1 embaixo do outro)
+local PageChat    = CreateTab("ChatRapido", "Chat Rápido")
+local PagePlacar  = CreateTab("Placar", "Placar")
+local PageFunc    = CreateTab("Funcoes", "Funções")
+local PageCamBola = CreateTab("CamBola", "Câmera / Bola")
+
+-- ==========================================
+-- ABA 1: CHAT RÁPIDO
+-- ==========================================
+local ChatList = Instance.new("UIListLayout")
+ChatList.Padding = UDim.new(0, 6)
+ChatList.Parent = PageChat
+
+local ChatCommands = {
+    {text = ":m push,não valeu o gol", color = Color3.fromRGB(95, 52, 28)},
+    {text = ":m bf", color = Color3.fromRGB(30, 56, 82)},
+    {text = ":m sem spamar m", color = Color3.fromRGB(92, 78, 26)},
+    {text = ":m gol", color = Color3.fromRGB(24, 78, 42)},
+    {text = ":m foi gol se continuar vou dar kick", color = Color3.fromRGB(115, 36, 36)},
+    {text = ":m se continuar dou kick", color = Color3.fromRGB(115, 36, 36)},
+    {text = ":m sem os viu", color = Color3.fromRGB(30, 56, 82)},
+    {text = ":m escanteio", color = Color3.fromRGB(24, 78, 42)},
+    {text = ":m falta", color = Color3.fromRGB(92, 78, 26)},
+    {text = ":m pênalti", color = Color3.fromRGB(110, 44, 44)},
+    {text = ":m se não deixar bater e kick,para", color = Color3.fromRGB(115, 36, 36)},
+    {text = ":m ss", color = Color3.fromRGB(34, 68, 52)},
+    {text = ":m n", color = Color3.fromRGB(78, 38, 38)}
+}
+
+for _, item in ipairs(ChatCommands) do
+    local cmdBtn = Instance.new("TextButton")
+    cmdBtn.Size = UDim2.new(0.97, 0, 0, 34)
+    cmdBtn.BackgroundColor3 = item.color
+    cmdBtn.BackgroundTransparency = 0.15
+    cmdBtn.Text = item.text
+    cmdBtn.TextColor3 = Color3.fromRGB(245, 248, 255)
+    cmdBtn.Font = Enum.Font.GothamBold
+    cmdBtn.TextSize = 12
+    cmdBtn.Parent = PageChat
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent = cmdBtn
+
+    cmdBtn.MouseButton1Click:Connect(function()
+        SendChatMessage(item.text)
+        TitleLabel.Text = "ENVIADO: " .. item.text
+    end)
+end
+
+-- ==========================================
+-- ABA 2: PLACAR (SEM ENVIAR :M AUTOMATICAMENTE)
+-- ==========================================
+local ScoreContainer = Instance.new("Frame")
+ScoreContainer.Size = UDim2.new(0.98, 0, 0, 210)
+ScoreContainer.BackgroundTransparency = 1
+ScoreContainer.Parent = PagePlacar
+
+local function CreateTeamScoreBox(teamName, posScaleX, accentColor, isHome)
+    local box = Instance.new("Frame")
+    box.Size = UDim2.new(0.47, 0, 0, 165)
+    box.Position = UDim2.new(posScaleX, 0, 0, 10)
+    box.BackgroundColor3 = Color3.fromRGB(26, 31, 40)
+    box.BackgroundTransparency = 0.1
+    box.Parent = ScoreContainer
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = box
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = accentColor
+    stroke.Thickness = 1.5
+    stroke.Parent = box
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, 34)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = teamName .. ":"
+    lbl.TextColor3 = Color3.fromRGB(240, 245, 255)
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 16
+    lbl.Parent = box
+
+    local numLbl = Instance.new("TextLabel")
+    numLbl.Size = UDim2.new(1, 0, 0, 56)
+    numLbl.Position = UDim2.new(0, 0, 0, 36)
+    numLbl.BackgroundTransparency = 1
+    numLbl.Text = "0"
+    numLbl.TextColor3 = accentColor
+    numLbl.Font = Enum.Font.GothamBlack
+    numLbl.TextSize = 38
+    numLbl.Parent = box
+
+    local minusBtn = Instance.new("TextButton")
+    minusBtn.Size = UDim2.new(0.4, 0, 0, 42)
+    minusBtn.Position = UDim2.new(0.07, 0, 0, 106)
+    minusBtn.BackgroundColor3 = Color3.fromRGB(165, 45, 45)
+    minusBtn.Text = "-"
+    minusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    minusBtn.Font = Enum.Font.GothamBold
+    minusBtn.TextSize = 22
+    minusBtn.Parent = box
+
+    local c1 = Instance.new("UICorner")
+    c1.CornerRadius = UDim.new(0, 7)
+    c1.Parent = minusBtn
+
+    local plusBtn = Instance.new("TextButton")
+    plusBtn.Size = UDim2.new(0.4, 0, 0, 42)
+    plusBtn.Position = UDim2.new(0.53, 0, 0, 106)
+    plusBtn.BackgroundColor3 = Color3.fromRGB(34, 145, 68)
+    plusBtn.Text = "+"
+    plusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    plusBtn.Font = Enum.Font.GothamBold
+    plusBtn.TextSize = 22
+    plusBtn.Parent = box
+
+    local c2 = Instance.new("UICorner")
+    c2.CornerRadius = UDim.new(0, 7)
+    c2.Parent = plusBtn
+
+    plusBtn.MouseButton1Click:Connect(function()
+        if isHome then
+            HomeScore = HomeScore + 1
+            numLbl.Text = tostring(HomeScore)
+            UpdateGameScore("Home", 1, HomeScore)
+        else
+            AwayScore = AwayScore + 1
+            numLbl.Text = tostring(AwayScore)
+            UpdateGameScore("Away", 1, AwayScore)
+        end
+        TitleLabel.Text = "PLACAR: Home " .. tostring(HomeScore) .. " x " .. tostring(AwayScore) .. " Away"
+    end)
+
+    minusBtn.MouseButton1Click:Connect(function()
+        if isHome then
+            HomeScore = math.max(0, HomeScore - 1)
+            numLbl.Text = tostring(HomeScore)
+            UpdateGameScore("Home", -1, HomeScore)
+        else
+            AwayScore = math.max(0, AwayScore - 1)
+            numLbl.Text = tostring(AwayScore)
+            UpdateGameScore("Away", -1, AwayScore)
+        end
+        TitleLabel.Text = "PLACAR: Home " .. tostring(HomeScore) .. " x " .. tostring(AwayScore) .. " Away"
+    end)
+
+    return numLbl
+end
+
+local HomeNumLbl = CreateTeamScoreBox("Home", 0.01, Color3.fromRGB(0, 165, 255), true)
+local AwayNumLbl = CreateTeamScoreBox("Away", 0.51, Color3.fromRGB(255, 95, 75), false)
+
+local ResetScoreBtn = Instance.new("TextButton")
+ResetScoreBtn.Size = UDim2.new(0.97, 0, 0, 34)
+ResetScoreBtn.Position = UDim2.new(0.01, 0, 0, 185)
+ResetScoreBtn.BackgroundColor3 = Color3.fromRGB(48, 54, 66)
+ResetScoreBtn.Text = "ZERAR PLACAR (0 x 0)"
+ResetScoreBtn.TextColor3 = Color3.fromRGB(235, 240, 245)
+ResetScoreBtn.Font = Enum.Font.GothamBold
+ResetScoreBtn.TextSize = 12
+ResetScoreBtn.Parent = ScoreContainer
+
+local ResetCorner = Instance.new("UICorner")
+ResetCorner.CornerRadius = UDim.new(0, 6)
+ResetCorner.Parent = ResetScoreBtn
+
+ResetScoreBtn.MouseButton1Click:Connect(function()
+    HomeScore = 0
+    AwayScore = 0
+    HomeNumLbl.Text = "0"
+    AwayNumLbl.Text = "0"
+    UpdateGameScore("Home", 0, 0)
+    UpdateGameScore("Away", 0, 0)
+    TitleLabel.Text = "PLACAR ZERADO: 0 x 0"
+end)
+
+-- ==========================================
+-- ABA 3: FUNÇÕES (LISTA DE NICKS + TP + CARTÕES)
+-- ==========================================
+local FuncTopInfo = Instance.new("TextLabel")
+FuncTopInfo.Size = UDim2.new(0.97, 0, 0, 24)
+FuncTopInfo.BackgroundColor3 = Color3.fromRGB(25, 31, 42)
+FuncTopInfo.Text = "Selecionado: Nenhum jogador"
+FuncTopInfo.TextColor3 = Color3.fromRGB(130, 200, 255)
+FuncTopInfo.Font = Enum.Font.GothamBold
+FuncTopInfo.TextSize = 12
+FuncTopInfo.Parent = PageFunc
+
+local InfoCorner = Instance.new("UICorner")
+InfoCorner.CornerRadius = UDim.new(0, 6)
+InfoCorner.Parent = FuncTopInfo
+
+local ActionGrid = Instance.new("Frame")
+ActionGrid.Size = UDim2.new(0.97, 0, 0, 76)
+ActionGrid.Position = UDim2.new(0, 0, 0, 28)
+ActionGrid.BackgroundTransparency = 1
+ActionGrid.Parent = PageFunc
+
+local GridLayout = Instance.new("UIGridLayout")
+GridLayout.CellSize = UDim2.new(0.485, 0, 0, 34)
+GridLayout.CellPadding = UDim2.new(0.03, 0, 0, 6)
+GridLayout.Parent = ActionGrid
+
+local function CreateActionBtn(text, color, callback)
+    local b = Instance.new("TextButton")
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 11
+    b.Parent = ActionGrid
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent = b
+
+    b.MouseButton1Click:Connect(callback)
+    return b
+end
+
+CreateActionBtn("TP NO JOGADOR", Color3.fromRGB(28, 92, 145), function()
+    if not SelectedPlayer or not SelectedPlayer.Character then return end
+    local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local targetHRP = SelectedPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if myHRP and targetHRP then
+        myHRP.CFrame = targetHRP.CFrame * CFrame.new(0, 0, 3)
+    end
+end)
+
+CreateActionBtn("PUXAR ELE EM MIM", Color3.fromRGB(45, 75, 130), function()
+    if not SelectedPlayer then return end
+    SendChatMessage(":bring " .. SelectedPlayer.Name)
+    if SelectedPlayer.Character and LocalPlayer.Character then
+        local myHRP = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local targetHRP = SelectedPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if myHRP and targetHRP then
+            targetHRP.CFrame = myHRP.CFrame * CFrame.new(0, 0, -3)
+        end
+    end
+end)
+
+CreateActionBtn("🟨 CARTÃO AMARELO", Color3.fromRGB(185, 145, 20), function()
+    GiveCardToSelected("Yellow")
+end)
+
+CreateActionBtn("🟥 CARTÃO VERMELHO", Color3.fromRGB(175, 35, 35), function()
+    GiveCardToSelected("Red")
+end)
+
+local PlayerListFrame = Instance.new("Frame")
+PlayerListFrame.Size = UDim2.new(0.97, 0, 0, 200)
+PlayerListFrame.Position = UDim2.new(0, 0, 0, 110)
+PlayerListFrame.BackgroundTransparency = 1
+PlayerListFrame.AutomaticSize = Enum.AutomaticSize.Y
+PlayerListFrame.Parent = PageFunc
+
+local PlayerListLayout = Instance.new("UIListLayout")
+PlayerListLayout.Padding = UDim.new(0, 5)
+PlayerListLayout.Parent = PlayerListFrame
+
+-- ==========================================
+-- ABA 4: CÂMERA / BOLA (:freecam, :a, :una, :hko, :ako, ESPECTAR)
+-- ==========================================
+local CamLayout = Instance.new("UIListLayout")
+CamLayout.Padding = UDim.new(0, 7)
+CamLayout.Parent = PageCamBola
+
+local function CreateCamBtn(text, color)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.97, 0, 0, 36)
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.Parent = PageCamBola
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent = b
+    return b
+end
+
+local FreecamBtn   = CreateCamBtn("🎥 FREECAM (:freecam)", Color3.fromRGB(48, 56, 74))
+local LockBallBtn  = CreateCamBtn("🔒 TRAVAR BOLA (:a)", Color3.fromRGB(34, 92, 62))
+local UnlockBallBtn = CreateCamBtn("🔓 DESTRAVAR BOLA (:una)", Color3.fromRGB(150, 82, 28))
+local HkoBtn       = CreateCamBtn("⚡ COMANDO (:hko)", Color3.fromRGB(38, 64, 98))
+local AkoBtn       = CreateCamBtn("⚡ COMANDO (:ako)", Color3.fromRGB(72, 42, 92))
+local SpectateBtn  = CreateCamBtn("👁️ ESPECTAR SELECIONADO: OFF", Color3.fromRGB(36, 74, 118))
+
+local SpectateListLabel = Instance.new("TextLabel")
+SpectateListLabel.Size = UDim2.new(0.97, 0, 0, 22)
+SpectateListLabel.BackgroundColor3 = Color3.fromRGB(25, 31, 42)
+SpectateListLabel.Text = "Escolha quem espectar (ou selecione na aba Funções):"
+SpectateListLabel.TextColor3 = Color3.fromRGB(130, 200, 255)
+SpectateListLabel.Font = Enum.Font.GothamBold
+SpectateListLabel.TextSize = 11
+SpectateListLabel.Parent = PageCamBola
+
+local cSpecLbl = Instance.new("UICorner")
+cSpecLbl.CornerRadius = UDim.new(0, 6)
+cSpecLbl.Parent = SpectateListLabel
+
+local SpectateListFrame = Instance.new("Frame")
+SpectateListFrame.Size = UDim2.new(0.97, 0, 0, 120)
+SpectateListFrame.BackgroundTransparency = 1
+SpectateListFrame.AutomaticSize = Enum.AutomaticSize.Y
+SpectateListFrame.Parent = PageCamBola
+
+local SpectateListLayout = Instance.new("UIListLayout")
+SpectateListLayout.Padding = UDim.new(0, 5)
+SpectateListLayout.Parent = SpectateListFrame
+
+FreecamBtn.MouseButton1Click:Connect(function()
+    StopSpectate()
+    SpectateBtn.Text = "👁️ ESPECTAR SELECIONADO: OFF"
+    SpectateBtn.BackgroundColor3 = Color3.fromRGB(36, 74, 118)
+    SendChatMessage(":freecam")
+    TitleLabel.Text = "ENVIADO: :freecam"
+end)
+
+LockBallBtn.MouseButton1Click:Connect(function()
+    SendChatMessage(":a")
+    TitleLabel.Text = "ENVIADO: :a"
+end)
+
+UnlockBallBtn.MouseButton1Click:Connect(function()
+    SendChatMessage(":una")
+    TitleLabel.Text = "ENVIADO: :una"
+end)
+
+HkoBtn.MouseButton1Click:Connect(function()
+    SendChatMessage(":hko")
+    TitleLabel.Text = "ENVIADO: :hko"
+end)
+
+AkoBtn.MouseButton1Click:Connect(function()
+    SendChatMessage(":ako")
+    TitleLabel.Text = "ENVIADO: :ako"
+end)
+
+local function RefreshSpectateUI()
+    if SpectatingTarget then
+        SpectateBtn.Text = "👁️ ESPECTANDO: " .. SpectatingTarget.Name .. " (PARAR)"
+        SpectateBtn.BackgroundColor3 = Color3.fromRGB(0, 132, 214)
+    elseif SelectedPlayer then
+        SpectateBtn.Text = "👁️ ESPECTAR (" .. SelectedPlayer.Name .. "): OFF"
+        SpectateBtn.BackgroundColor3 = Color3.fromRGB(36, 74, 118)
+    else
+        SpectateBtn.Text = "👁️ ESPECTAR SELECIONADO: OFF"
+        SpectateBtn.BackgroundColor3 = Color3.fromRGB(36, 74, 118)
+    end
+end
+
+SpectateBtn.MouseButton1Click:Connect(function()
+    if SpectatingTarget then
+        StopSpectate()
+        RefreshSpectateUI()
+        TitleLabel.Text = "STATUS: Espectar desligado"
+    else
+        if not SelectedPlayer then
+            TitleLabel.Text = "Selecione um jogador primeiro!"
+            return
+        end
+        SpectatingTarget = SelectedPlayer
+        RefreshSpectateUI()
+        TitleLabel.Text = "ESPECTANDO: " .. SelectedPlayer.Name
+    end
+end)
+
+local function RefreshPlayerList()
+    for _, child in ipairs(PlayerListFrame:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+    for _, child in ipairs(SpectateListFrame:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local pBtn = Instance.new("TextButton")
+        pBtn.Size = UDim2.new(1, 0, 0, 32)
+        pBtn.BackgroundColor3 = (SelectedPlayer == plr) and Color3.fromRGB(0, 120, 200) or Color3.fromRGB(30, 35, 44)
+        pBtn.Text = "  👤 " .. plr.DisplayName .. " (@" .. plr.Name .. ")"
+        pBtn.TextColor3 = Color3.fromRGB(235, 240, 245)
+        pBtn.Font = Enum.Font.GothamSemibold
+        pBtn.TextSize = 12
+        pBtn.TextXAlignment = Enum.TextXAlignment.Left
+        pBtn.Parent = PlayerListFrame
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = pBtn
+
+        pBtn.MouseButton1Click:Connect(function()
+            SelectedPlayer = plr
+            FuncTopInfo.Text = "Selecionado: " .. plr.Name
+            RefreshPlayerList()
+        end)
+
+        local isSpec = (SpectatingTarget == plr)
+        local sBtn = Instance.new("TextButton")
+        sBtn.Size = UDim2.new(1, 0, 0, 30)
+        sBtn.BackgroundColor3 = isSpec and Color3.fromRGB(0, 132, 214) or ((SelectedPlayer == plr) and Color3.fromRGB(42, 65, 92) or Color3.fromRGB(30, 35, 44))
+        sBtn.Text = (isSpec and "  👁️ ESPECTANDO: " or "  👤 ") .. plr.DisplayName .. " (@" .. plr.Name .. ")"
+        sBtn.TextColor3 = Color3.fromRGB(235, 240, 245)
+        sBtn.Font = Enum.Font.GothamSemibold
+        sBtn.TextSize = 11
+        sBtn.TextXAlignment = Enum.TextXAlignment.Left
+        sBtn.Parent = SpectateListFrame
+
+        local sc = Instance.new("UICorner")
+        sc.CornerRadius = UDim.new(0, 6)
+        sc.Parent = sBtn
+
+        sBtn.MouseButton1Click:Connect(function()
+            SelectedPlayer = plr
+            FuncTopInfo.Text = "Selecionado: " .. plr.Name
+            if SpectatingTarget == plr then
+                StopSpectate()
+                TitleLabel.Text = "STATUS: Espectar desligado"
+            else
+                SpectatingTarget = plr
+                TitleLabel.Text = "ESPECTANDO: " .. plr.Name
+            end
+            RefreshPlayerList()
+        end)
+    end
+
+    RefreshSpectateUI()
+end
+
+Players.PlayerAdded:Connect(RefreshPlayerList)
+Players.PlayerRemoving:Connect(function(plr)
+    if SelectedPlayer == plr then
+        SelectedPlayer = nil
+        FuncTopInfo.Text = "Selecionado: Nenhum jogador"
+    end
+    if SpectatingTarget == plr then
+        StopSpectate()
+    end
+    task.wait(0.1)
+    RefreshPlayerList()
+end)
+
+RefreshPlayerList()
+SelectTab("ChatRapido")
